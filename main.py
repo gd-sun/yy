@@ -1,273 +1,419 @@
 import asyncio
-from utils import (
-    get_channel_items,
-    update_channel_urls_txt,
-    update_file,
-    sort_urls_by_speed_and_resolution,
-    get_total_urls_from_info_list,
-    use_accessible_url,
-    get_channels_by_subscribe_urls,
-    check_url_by_patterns,
-    get_channels_by_fofa,
-    async_get_channels_info_list_by_online_search,
-    format_channel_name,
-    resource_path,
-    load_external_config,
-)
-import logging
-from logging.handlers import RotatingFileHandler
+import copy
+import datetime
+import gzip
 import os
-from tqdm import tqdm
-from tqdm.asyncio import tqdm_asyncio
-import threading
+import pickle
 from time import time
+from typing import Callable, Optional, Any
 
-config_path = resource_path("user_config.py")
-default_config_path = resource_path("config.py")
-config = (
-    load_external_config("user_config.py")
-    if os.path.exists(config_path)
-    else load_external_config("config.py")
+import pytz
+from tqdm import tqdm
+
+import utils.constants as constants
+import utils.frozen as frozen
+from updates.epg import get_epg
+from updates.epg.tools import write_to_xml, compress_to_gz
+from updates.subscribe import get_channels_by_subscribe_urls
+from utils.aggregator import ResultAggregator
+from utils.channel import get_channel_items, append_total_data, test_speed
+from utils.config import config
+from utils.i18n import t
+from utils.speed import clear_cache
+from utils.tools import (
+    get_pbar_remaining,
+    process_nested_dict,
+    format_interval,
+    check_ipv6_support,
+    get_urls_from_file,
+    get_version_info,
+    get_urls_len,
+    get_public_url,
+    parse_times,
+    to_serializable,
 )
+from utils.types import CategoryChannelData
+from utils.whitelist import load_whitelist_maps, get_section_entries
+
+ProgressCallback = Callable[..., Any]
 
 
 class UpdateSource:
-
     def __init__(self):
+        self.whitelist_maps = None
+        self.blacklist = None
+
+        self.update_progress: Optional[ProgressCallback] = None
         self.run_ui = False
-        self.thread = None
-        self.tasks = []
-        self.channel_items = get_channel_items()
-        self.results = {}
-        self.channel_queue = asyncio.Queue()
-        self.semaphore = asyncio.Semaphore(10)
-        self.channel_data = {}
-        self.pbar = None
+
+        self.tasks: list[asyncio.Task] = []
+
+        self.channel_items: CategoryChannelData = {}
+        self.channel_names: list[str] = []
+
+        self.subscribe_result = {}
+        self.epg_result = {}
+
+        self.channel_data: CategoryChannelData = {}
+
+        self.pbar: Optional[tqdm] = None
         self.total = 0
         self.start_time = None
 
-    def get_pbar_remaining(self):
-        try:
-            elapsed = time() - self.start_time
-            completed_tasks = self.pbar.n
-            if completed_tasks > 0:
-                avg_time_per_task = elapsed / completed_tasks
-                remaining_tasks = self.pbar.total - completed_tasks
-                remaining_time = self.pbar.format_interval(
-                    avg_time_per_task * remaining_tasks
-                )
-            else:
-                remaining_time = "未知"
-            return remaining_time
-        except Exception as e:
-            print(f"Error: {e}")
+        self.stop_event: Optional[asyncio.Event] = None
+        self.ipv6_support = False
+        self.now = None
 
-    def append_data_to_info_data(self, cate, name, data):
-        for url, date, resolution in data:
-            if url and check_url_by_patterns(url):
-                if self.channel_data.get(cate) is None:
-                    self.channel_data[cate] = {}
-                if self.channel_data[cate].get(name) is None:
-                    self.channel_data[cate][name] = []
-                self.channel_data[cate][name].append((url, date, resolution))
+        self.aggregator: Optional[ResultAggregator] = None
 
-    async def sort_channel_list(self, cate, name, info_list):
-        try:
-            if config.open_sort:
-                sorted_data = await sort_urls_by_speed_and_resolution(info_list)
-                if sorted_data:
-                    for (
-                        url,
-                        date,
-                        resolution,
-                    ), response_time in sorted_data:
-                        logging.info(
-                            f"Name: {name}, URL: {url}, Date: {date}, Resolution: {resolution}, Response Time: {response_time}ms"
-                        )
-                    data = [
-                        (url, date, resolution)
-                        for (url, date, resolution), _ in sorted_data
-                    ]
-                    self.append_data_to_info_data(cate, name, data)
-        except Exception as e:
-            logging.error(f"Error: {e}")
-        finally:
+    # ----------------------------
+    # progress / pbar
+    # ----------------------------
+    def pbar_update(self, name: str = "", item_name: str = ""):
+        if not self.pbar:
+            return
+        if self.pbar.n < self.total:
             self.pbar.update()
-            self.pbar.set_description(
-                f"Sorting, {self.pbar.total - self.pbar.n} urls remaining"
-            )
-            self.update_progress(
-                f"正在测速排序, 剩余{self.pbar.total - self.pbar.n}个接口, 预计剩余时间: {self.get_pbar_remaining()}",
-                int((self.pbar.n / self.total) * 100),
-            )
-
-    async def process_channel(self):
-        async with self.semaphore:
-            try:
-                cate, name, old_urls = await self.channel_queue.get()
-                format_name = format_channel_name(name)
-                if config.open_subscribe:
-                    self.append_data_to_info_data(
-                        cate, name, self.results["open_subscribe"].get(format_name, [])
-                    )
-                if config.open_multicast:
-                    self.append_data_to_info_data(
-                        cate, name, self.results["open_multicast"].get(format_name, [])
-                    )
-                if config.open_online_search and self.results["open_online_search"]:
-                    online_info_list = (
-                        await async_get_channels_info_list_by_online_search(
-                            self.results["open_online_search"],
-                            format_name,
-                        )
-                    )
-                    if online_info_list:
-                        self.append_data_to_info_data(cate, name, online_info_list)
-                if len(self.channel_data.get(cate, {}).get(name, [])) == 0:
-                    self.append_data_to_info_data(
-                        cate, name, [(url, None, None) for url in old_urls]
-                    )
-            except asyncio.exceptions.CancelledError:
-                print("Update cancelled!")
-            finally:
-                self.channel_queue.task_done()
-                self.pbar.update()
-                self.pbar.set_description(
-                    f"Processing, {self.total - self.pbar.n} channels remaining"
-                )
+            remaining_total = self.total - self.pbar.n
+            remaining_time = get_pbar_remaining(n=self.pbar.n, total=self.total, start_time=self.start_time)
+            if self.update_progress:
                 self.update_progress(
-                    f"正在更新, 剩余{self.total - self.pbar.n}个频道待处理, 预计剩余时间: {self.get_pbar_remaining()}",
+                    t("msg.progress_desc").format(
+                        name=name,
+                        remaining_total=remaining_total,
+                        item_name=item_name,
+                        remaining_time=remaining_time,
+                    ),
                     int((self.pbar.n / self.total) * 100),
                 )
 
-    def write_channel_to_file(self):
-        self.pbar = tqdm(total=self.total)
-        self.pbar.set_description(f"Writing, {self.total} channels remaining")
+    # ----------------------------
+    # IO: cache
+    # ----------------------------
+    def _load_cache(self) -> dict:
+        if not (config.open_history and os.path.exists(constants.cache_path)):
+            return {}
+        try:
+            with gzip.open(constants.cache_path, "rb") as f:
+                return pickle.load(f) or {}
+        except Exception:
+            return {}
+
+    def _save_cache(self, cache_result: dict):
+        serializable = to_serializable(cache_result or {})
+        cache_dir = os.path.dirname(constants.cache_path)
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+        with gzip.open(constants.cache_path, "wb") as f:
+            pickle.dump(serializable, f)
+
+    # ----------------------------
+    # stage 1: prepare
+    # ----------------------------
+    def _prepare_channel_data(self):
+        self.whitelist_maps = load_whitelist_maps(constants.whitelist_path)
+        self.blacklist = get_urls_from_file(constants.blacklist_path, pattern_search=False)
+        self.channel_items = get_channel_items(self.whitelist_maps, self.blacklist)
+        self.channel_data = {}
+
+        self.channel_names = [
+            name for channel_obj in self.channel_items.values() for name in channel_obj.keys()
+        ]
+
+        if config.open_history and os.path.exists(constants.frozen_path):
+            frozen.load(constants.frozen_path)
+
+    # ----------------------------
+    # stage 2: fetch subscribe/epg (concurrent)
+    # ----------------------------
+    async def _fetch_subscribe(self, channel_names: list[str]):
+        whitelist_subscribe_urls, default_subscribe_urls = get_section_entries(
+            constants.subscribe_path,
+            pattern=constants.url_pattern,
+        )
+        subscribe_urls = list(dict.fromkeys(whitelist_subscribe_urls + default_subscribe_urls))
+        print(
+            t("msg.subscribe_urls_whitelist_total").format(
+                default_count=len(default_subscribe_urls),
+                whitelist_count=len(whitelist_subscribe_urls),
+                total=len(subscribe_urls),
+            )
+        )
+        if not subscribe_urls:
+            print(t("msg.no_subscribe_urls").format(file=constants.subscribe_path))
+            return {}
+
+        return await get_channels_by_subscribe_urls(
+            subscribe_urls,
+            names=channel_names,
+            whitelist=whitelist_subscribe_urls,
+            callback=self.update_progress,
+        )
+
+    async def _fetch_epg(self, channel_names: list[str]):
+        return await get_epg(channel_names, callback=self.update_progress)
+
+    async def visit_page(self, channel_names: list[str] = None):
+        """
+        Visits subscribe and epg pages concurrently to fetch data.
+        """
+        channel_names = channel_names or []
+
+        cors: list[tuple[str, asyncio.Future]] = []
+        if config.open_method.get("subscribe"):
+            cors.append(("subscribe_result", asyncio.create_task(self._fetch_subscribe(channel_names))))
+        if config.open_method.get("epg"):
+            cors.append(("epg_result", asyncio.create_task(self._fetch_epg(channel_names))))
+
+        if not cors:
+            return
+
+        results = await asyncio.gather(*(c for _, c in cors), return_exceptions=True)
+        for (attr, _), res in zip(cors, results):
+            if isinstance(res, Exception):
+                print(f"{attr} failed: {res}")
+                setattr(self, attr, {})
+            else:
+                setattr(self, attr, res)
+
+    def _write_epg_files_if_needed(self):
+        if not self.epg_result:
+            return
+        write_to_xml(self.epg_result, constants.epg_result_path)
+        compress_to_gz(constants.epg_result_path, constants.epg_gz_result_path)
+
+    # ----------------------------
+    # stage 3: aggregator lifecycle
+    # ----------------------------
+    async def _start_aggregator(self, cache: dict):
+        self.aggregator = ResultAggregator(
+            base_data=self.channel_data,
+            first_channel_name=self.channel_names[0] if self.channel_names else None,
+            ipv6_support=self.ipv6_support,
+            write_interval=2.0,
+            result=cache,
+        )
+        await self.aggregator.start()
+
+    async def _stop_aggregator(self):
+        if self.aggregator:
+            await self.aggregator.stop()
+            self.aggregator = None
+
+    # ----------------------------
+    # stage 4: speed test
+    # ----------------------------
+    async def _run_speed_test(self) -> CategoryChannelData:
+        """
+        Run speed test on the channel data and return the test results.
+        """
+        urls_total = get_urls_len(self.channel_data)
+        test_data = copy.deepcopy(self.channel_data)
+
+        process_nested_dict(
+            test_data,
+            seen=set(),
+            filter_host=config.speed_test_filter_host,
+            ipv6_support=self.ipv6_support,
+        )
+        self.total = get_urls_len(test_data)
+
+        print(t("msg.total_urls_need_test_speed").format(total=urls_total, speed_total=self.total))
+
+        if self.total <= 0:
+            self.aggregator.is_last = True
+            await self.aggregator.flush_once(force=True)
+            return {}
+        if self.update_progress:
+            self.update_progress(
+                t("msg.progress_speed_test").format(total=urls_total, speed_total=self.total),
+                0,
+            )
+
         self.start_time = time()
-        for cate, channel_obj in self.channel_items.items():
-            for name in channel_obj.keys():
-                info_list = self.channel_data.get(cate, {}).get(name, [])
-                try:
-                    channel_urls = get_total_urls_from_info_list(info_list)
-                    update_channel_urls_txt(cate, name, channel_urls)
-                finally:
-                    self.pbar.update()
-                    self.pbar.set_description(
-                        f"Writing, {self.pbar.total - self.pbar.n} channels remaining"
-                    )
-                    self.update_progress(
-                        f"正在写入结果, 剩余{self.pbar.total - self.pbar.n}个接口, 预计剩余时间: {self.get_pbar_remaining()}",
-                        int((self.pbar.n / self.total) * 100),
-                    )
+        self.pbar = tqdm(total=self.total, desc=t("pbar.speed_test"))
+        try:
+            return await test_speed(
+                test_data,
+                ipv6=self.ipv6_support,
+                callback=lambda: self.pbar_update(name=t("pbar.speed_test"), item_name=t("pbar.url")),
+                on_task_complete=self.aggregator.add_item,
+            )
+        finally:
+            if self.pbar:
+                self.pbar.close()
+                self.pbar = None
 
-    async def visit_page(self):
-        task_dict = {
-            "open_subscribe": get_channels_by_subscribe_urls,
-            "open_multicast": get_channels_by_fofa,
-            "open_online_search": use_accessible_url,
-        }
-        for config_name, task_func in task_dict.items():
-            if getattr(config, config_name):
-                task = None
-                if config_name == "open_subscribe":
-                    task = asyncio.create_task(task_func(self.update_progress))
-                elif config_name == "open_multicast":
-                    task = asyncio.create_task(task_func(self.update_progress))
-                else:
-                    task = asyncio.create_task(task_func(self.update_progress))
-                if task:
-                    self.tasks.append(task)
-        task_results = await tqdm_asyncio.gather(*self.tasks, disable=True)
-        self.tasks = []
-        for i, config_name in enumerate(
-            [name for name in task_dict if getattr(config, name)]
-        ):
-            self.results[config_name] = task_results[i]
-        for cate, channel_obj in self.channel_items.items():
-            for name in channel_obj.keys():
-                await self.channel_queue.put((cate, name, channel_obj[name]))
+    # ----------------------------
+    # stage 5: ui final notify
+    # ----------------------------
+    def _notify_ui_finished(self, main_start_time: float):
+        if not self.run_ui:
+            return
 
+        open_service = config.open_service
+        service_tip = t("msg.service_tip") if open_service else ""
+
+        tip = (
+            t("msg.service_run_success").format(service_tip=service_tip)
+            if open_service and config.open_update is False
+            else t("msg.update_completed").format(
+                time=format_interval(time() - main_start_time),
+                service_tip=service_tip,
+            )
+        )
+
+        if self.update_progress:
+            self.update_progress(
+                tip,
+                100,
+                finished=True,
+                url=f"{get_public_url()}" if open_service else None,
+                now=self.now,
+            )
+
+    # ----------------------------
+    # main flow
+    # ----------------------------
     async def main(self):
         try:
-            self.tasks = []
-            await self.visit_page()
-            self.total = self.channel_queue.qsize()
-            self.tasks = [
-                asyncio.create_task(self.process_channel()) for _ in range(self.total)
-            ]
-            self.pbar = tqdm_asyncio(total=self.total)
-            self.pbar.set_description(f"Processing, {self.total} channels remaining")
-            self.update_progress(
-                f"正在更新, 共{self.total}个频道",
-                int((self.pbar.n / self.total) * 100),
-            )
-            self.start_time = time()
-            await tqdm_asyncio.gather(*self.tasks, disable=True)
-            if config.open_sort:
-                self.tasks = [
-                    asyncio.create_task(self.sort_channel_list(cate, name, info_list))
-                    for cate, channel_obj in self.channel_data.items()
-                    for name, info_list in channel_obj.items()
-                ]
-                self.pbar = tqdm_asyncio(total=len(self.tasks))
-                self.pbar.set_description(f"Sorting, {len(self.tasks)} urls remaining")
-                self.update_progress(
-                    f"正在测速排序, 共{len(self.tasks)}个接口",
-                    int((self.pbar.n / len(self.tasks)) * 100),
-                )
-                self.start_time = time()
-                self.channel_data = {}
-                await tqdm_asyncio.gather(*self.tasks, disable=True)
-            self.write_channel_to_file()
-            self.pbar.close()
-            for handler in logging.root.handlers[:]:
-                handler.close()
-                logging.root.removeHandler(handler)
-            user_final_file = getattr(config, "final_file", "result.txt")
-            user_log_file = (
-                "user_result.log" if os.path.exists("user_config.py") else "result.log"
-            )
-            update_file(user_final_file, "result_new.txt")
-            update_file(user_log_file, "result_new.log")
-            print(f"Update completed! Please check the {user_final_file} file!")
-            self.update_progress(f"更新完成, 请检查{user_final_file}文件", 100, True)
-            self.stop()
-        except asyncio.exceptions.CancelledError:
-            print("Update cancelled!")
+            main_start_time = time()
 
-    def start(self, callback=None):
-        def default_callback(self, *args, **kwargs):
+            if not config.open_update:
+                self._notify_ui_finished(main_start_time)
+                return
+
+            self._prepare_channel_data()
+
+            if not self.channel_names:
+                print(t("msg.no_channel_names").format(file=config.source_file))
+                self._notify_ui_finished(main_start_time)
+                return
+
+            await self.visit_page(self.channel_names)
+            self.tasks = []
+            self._write_epg_files_if_needed()
+
+            append_total_data(
+                self.channel_items.items(),
+                self.channel_data,
+                self.subscribe_result,
+                self.whitelist_maps,
+                self.blacklist,
+            )
+
+            cache = self._load_cache()
+
+            await self._start_aggregator(cache)
+            try:
+                if config.open_speed_test:
+                    clear_cache()
+                    await self._run_speed_test()
+                else:
+                    self.aggregator.test_results = self.channel_data
+                    self.aggregator.is_last = True
+                    await self.aggregator.flush_once(force=True)
+
+            finally:
+                if config.open_history:
+                    self._save_cache(self.aggregator.result)
+                    frozen.save(constants.frozen_path)
+                await self._stop_aggregator()
+
+            print(
+                t("msg.update_completed").format(
+                    time=format_interval(time() - main_start_time),
+                    service_tip="",
+                )
+            )
+            self._notify_ui_finished(main_start_time)
+
+        except asyncio.exceptions.CancelledError:
+            print(t("msg.update_cancelled"))
+
+    # ----------------------------
+    # lifecycle control
+    # ----------------------------
+    async def start(self, callback=None):
+        def default_callback(*args, **kwargs):
             pass
 
         self.update_progress = callback or default_callback
         self.run_ui = True if callback else False
-        handler = RotatingFileHandler("result_new.log", encoding="utf-8")
-        logging.basicConfig(
-            handlers=[handler],
-            format="%(message)s",
-            level=logging.INFO,
-        )
 
-        def run_loop():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                loop.run_until_complete(self.main())
-            finally:
-                loop.close()
+        if self.run_ui:
+            self.update_progress(t("msg.check_ipv6_support"), 0)
 
-        self.thread = threading.Thread(target=run_loop, daemon=True)
-        self.thread.start()
-        if not self.run_ui:
-            self.thread.join()
+        self.ipv6_support = config.ipv6_support or check_ipv6_support()
+
+        if not os.getenv("GITHUB_ACTIONS") and (config.update_interval or config.update_times):
+            await self.scheduler(asyncio.Event())
+        elif config.update_startup:
+            await self.main()
 
     def stop(self):
         for task in self.tasks:
             task.cancel()
         self.tasks = []
-        asyncio.get_event_loop().stop()
+
+        if self.pbar:
+            self.pbar.close()
+            self.pbar = None
+
+        if self.stop_event:
+            self.stop_event.set()
+
+    async def scheduler(self, stop_event: asyncio.Event):
+        self.stop_event = stop_event
+        tz = pytz.timezone(config.time_zone)
+        mode = config.update_mode
+        update_times = parse_times(config.update_times)
+
+        try:
+            self.now = datetime.datetime.now(tz)
+            if config.update_startup:
+                await self.main()
+
+            while not stop_event.is_set():
+                self.now = datetime.datetime.now(tz)
+
+                if mode == "time" and update_times:
+                    candidates = []
+                    for h, m in update_times:
+                        candidate = self.now.replace(hour=h, minute=m, second=0, microsecond=0)
+                        if candidate <= self.now:
+                            candidate = candidate + datetime.timedelta(days=1)
+                        candidates.append(candidate)
+
+                    next_time = min(candidates)
+                    wait_seconds = (next_time - self.now).total_seconds()
+                    print(t("msg.schedule_update_time").format(time=next_time.strftime("%Y-%m-%d %H:%M:%S")))
+
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=wait_seconds)
+                        if stop_event.is_set():
+                            break
+                    except asyncio.TimeoutError:
+                        self.now = datetime.datetime.now(tz)
+                        await self.main()
+                else:
+                    next_time = self.now + datetime.timedelta(hours=config.update_interval)
+                    print(t("msg.schedule_update_time").format(time=next_time.strftime("%Y-%m-%d %H:%M:%S")))
+
+                    try:
+                        await asyncio.wait_for(stop_event.wait(), timeout=config.update_interval * 3600)
+                    except asyncio.TimeoutError:
+                        self.now = datetime.datetime.now(tz)
+                        await self.main()
+
+        except asyncio.CancelledError:
+            print(t("msg.schedule_cancelled"))
 
 
 if __name__ == "__main__":
+    info = get_version_info()
+    print(t("msg.version_info").format(name=info["name"], version=info["version"]))
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     update_source = UpdateSource()
-    update_source.start()
+    loop.run_until_complete(update_source.start())
